@@ -15,7 +15,7 @@ const dLabel=d=>{const t=todayStr();if(d===t)return 'Oggi';const y=new Date();y.
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const nid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,8);
 const clone=o=>JSON.parse(JSON.stringify(o));
-const parseEur=s=>{s=String(s??'').trim().replace(/[\s€]/g,'');if(!s)return 0;if(s.includes(','))s=s.replace(/\./g,'').replace(',','.');const n=Number(s);return isFinite(n)&&n>=0?Math.round(n*100):NaN};
+const parseEur=s=>{s=String(s??'').trim().replace(/[\s€]/g,'');if(!s)return 0;if(s.includes(','))s=s.replace(/\./g,'').replace(',','.');else if(/^\d{1,3}(\.\d{3})+$/.test(s))s=s.replace(/\./g,'');const n=Number(s);return isFinite(n)&&n>=0?Math.round(n*100):NaN};
 const toIn=c=>c?(c/100).toFixed(2).replace('.',','):'';
 const pct=(a,b)=>b?Math.round(a/b*100):0;
 const ls={get(k){try{return localStorage.getItem(k)}catch(e){return null}},set(k,v){try{localStorage.setItem(k,v)}catch(e){}}};
@@ -56,12 +56,12 @@ function dbFail(error,what){console.warn(what,error);
   toast('Non salvato ('+what+'). Controlla la connessione e riprova.')}
 
 async function fetchRange(fromDate,toDate){let all=[],from=0;
-  for(;;){let q=sb.from('transactions').select('*').eq('user_id',S.uid).gte('date',fromDate).order('date',{ascending:false}).range(from,from+999);
+  for(;;){let q=sb.from('transactions').select('*').eq('user_id',S.uid).gte('date',fromDate).order('date',{ascending:false}).order('id',{ascending:true}).range(from,from+999);
     if(toDate)q=q.lt('date',toDate);const {data,error}=await q;if(error)throw error;all=all.concat(data);if(data.length<1000)break;from+=1000}
   return all.map(fromRow)}
 async function loadAll(){
   const {data:st,error:e1}=await sb.from('settings').select('data').eq('user_id',S.uid).maybeSingle();if(e1)throw e1;
-  if(!st){S.settings=clone(DEF);const {error}=await sb.from('settings').insert({user_id:S.uid,data:S.settings});if(error)throw error}
+  if(!st){S.settings=clone(DEF);const {error}=await sb.from('settings').upsert({user_id:S.uid,data:S.settings},{onConflict:'user_id',ignoreDuplicates:true});if(error)throw error;const {data:again}=await sb.from('settings').select('data').eq('user_id',S.uid).maybeSingle();if(again)S.settings=normSettings(again.data)}
   else S.settings=normSettings(st.data);
   const from=addM(curYm(),-12);const rows=await fetchRange(from+'-01');
   S.tx=new Map(rows.map(t=>[t.id,t]));S.loadedFrom=from;reindex();
@@ -80,15 +80,18 @@ async function upsertTx(t,prev){S.tx.set(t.id,t);reindex();draw();
 async function deleteTx(t){S.tx.delete(t.id);reindex();draw();
   const {error}=await sb.from('transactions').delete().eq('user_id',S.uid).eq('id',t.id);if(error){S.tx.set(t.id,t);reindex();draw();dbFail(error,'eliminazione');return false}return true}
 
-async function runRecurring(){const ym=curYm(),D=dim(ym),today=Number(todayStr().slice(8));
-  const due=(S.settings.recurring||[]).filter(r=>(r.start||'0000-00')<=ym&&Math.min(r.day,D)<=today);if(!due.length)return;
-  const {data:runs,error}=await sb.from('recurring_runs').select('rec_id').eq('user_id',S.uid).eq('ym',ym);if(error){console.warn(error);return}
-  const done=new Set((runs||[]).map(r=>r.rec_id));let n=0;
-  for(const r of due){if(done.has(r.id))continue;
-    const {error:e}=await sb.from('recurring_runs').insert({user_id:S.uid,rec_id:r.id,ym});
-    if(e){if(e.code!=='23505')console.warn(e);continue}
-    const t={id:'r-'+r.id+'-'+ym,date:ym+'-'+pad(Math.min(r.day,D)),amount:r.amount,type:r.type,cat:r.cat,acc:r.acc,note:r.desc,avoid:false,rec:r.id,ts:Date.now()};
-    const {error:e2}=await sb.from('transactions').upsert(toRow(t));if(!e2){S.tx.set(t.id,t);n++}}
+async function runRecurring(){const cur=curYm(),today=Number(todayStr().slice(8));let n=0;
+  // controlla il mese corrente e i 2 precedenti: se l'app non viene aperta per settimane, nessuna voce va persa
+  for(let back=2;back>=0;back--){const ym=addM(cur,-back),D=dim(ym);
+    const due=(S.settings.recurring||[]).filter(r=>(r.start||'0000-00')<=ym&&(back>0||Math.min(r.day,D)<=today));if(!due.length)continue;
+    const {data:runs,error}=await sb.from('recurring_runs').select('rec_id').eq('user_id',S.uid).eq('ym',ym);if(error){console.warn(error);return}
+    const done=new Set((runs||[]).map(r=>r.rec_id));
+    for(const r of due){if(done.has(r.id))continue;
+      const {error:e}=await sb.from('recurring_runs').insert({user_id:S.uid,rec_id:r.id,ym});
+      if(e){if(e.code!=='23505')console.warn(e);continue}
+      const t={id:'r-'+r.id+'-'+ym,date:ym+'-'+pad(Math.min(r.day,D)),amount:r.amount,type:r.type,cat:r.cat,acc:r.acc,note:r.desc,avoid:false,rec:r.id,ts:Date.now()};
+      const {error:e2}=await sb.from('transactions').upsert(toRow(t));
+      if(e2){await sb.from('recurring_runs').delete().eq('user_id',S.uid).eq('rec_id',r.id).eq('ym',ym);console.warn(e2)}else{S.tx.set(t.id,t);n++}}}
   if(n){reindex();draw();toast(n===1?'Registrata 1 voce ricorrente':'Registrate '+n+' voci ricorrenti')}}
 
 /* ================= accesso e 2FA ================= */
@@ -140,7 +143,7 @@ async function onAuthSubmit(id){const a=S.auth;a.err='';a.msg='';const btn=main.
     else if(a.mode==='signup'){const pw=document.getElementById('pw').value;if(pw.length<12)throw new Error('La password deve avere almeno 12 caratteri.');
       const {data,error}=await sb.auth.signUp({email,password:pw,options:{emailRedirectTo:redirect()}});if(error)throw error;
       if(data.session){await route();return}a.mode='login';a.msg='Ti ho inviato una email di conferma: aprila, poi torna qui e accedi.'}
-    else{const pw=document.getElementById('pw').value;const {error}=await sb.auth.signInWithPassword({email,password:pw});if(error)throw error;await route();return}}
+    else{const pw=document.getElementById('pw').value;const {error}=await sb.auth.signInWithPassword({email,password:pw});if(error)throw error;touch();await route();return}}
   else if(id==='fMfa'||id==='fEnroll'){const code=document.getElementById('code').value.replace(/\D/g,'');
     let factorId;if(id==='fEnroll')factorId=S.enroll.id;else{const {data}=await sb.auth.mfa.listFactors();factorId=(data.totp||[]).find(f=>f.status==='verified')?.id}
     if(!factorId)throw new Error('Nessun dispositivo configurato.');
@@ -161,7 +164,7 @@ function draw(){
   const app=S.phase==='app';
   document.getElementById('nav').hidden=!app;document.getElementById('fab').hidden=!app;
   if(!app){main.innerHTML=authView();return}
-  const a=document.activeElement;if(a&&main.contains(a)&&/INPUT|SELECT/.test(a.tagName)&&a.id!=='q'){if(!a.dataset.wait){a.dataset.wait='1';a.addEventListener('blur',()=>{delete a.dataset.wait;draw()},{once:true})}return}
+  const a=document.activeElement;if(a&&main.contains(a)&&/INPUT|SELECT/.test(a.tagName)){if(!a.dataset.wait){a.dataset.wait='1';a.addEventListener('blur',()=>{delete a.dataset.wait;draw()},{once:true})}return}
   main.innerHTML=V[S.view]();
   document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.go===S.view));
 }
@@ -186,7 +189,7 @@ oggi(){const st=stats(S.ym),isCur=S.ym===curYm(),tb=totBudget(),D=dim(S.ym),day=
   else{const rc=Math.min(st.recExp,tb),per=isCur?Math.max(0,left)/daysLeft:0,exp=rc+(tb-rc)*day/D,diff=exp-st.exp,p=st.exp/tb*100;
     const sub=isCur?(left<0?`Hai superato il budget del mese di ${eur(-left)}.`:`Restano ${eur(left)} per ${daysLeft} ${daysLeft===1?'giorno':'giorni'}. ${diff>=0?`Sei ${eur(diff)} sotto il ritmo previsto.`:`Sei ${eur(-diff)} sopra il ritmo previsto.`}`):(left<0?'Budget superato a fine mese.':'Avanzato a fine mese.');
     hero=`<section class="hero"><p class="lbl">${isCur?'Puoi spendere oggi':(left<0?'Sforamento':'Budget non speso')}</p><p class="big num">${isCur?eur(Math.floor(per)):eur(left)}</p><p class="sub">${sub}</p>
-    <div class="meter" role="img" aria-label="Speso ${p.toFixed(0)}% del tetto"><div class="fill ${p>100?'over':''}" style="width:${Math.min(100,p).toFixed(1)}%"></div>${isCur?`<div class="pace" style="left:${(day/D*100).toFixed(1)}%"></div>`:''}</div>
+    <div class="meter" role="img" aria-label="Speso ${p.toFixed(0)}% del tetto"><div class="fill ${p>100?'over':''}" style="width:${Math.min(100,p).toFixed(1)}%"></div>${isCur?`<div class="pace" style="left:${Math.min(100,exp/tb*100).toFixed(1)}%"></div>`:''}</div>
     <div class="meterlbl"><span class="num">Speso ${eur(st.exp)}</span><span class="num">Tetto ${eur(tb)}</span></div></section>`}
   const saved=st.inc-st.exp,rate=st.inc?pct(saved,st.inc):null;
   const alerts=cats('exp').filter(c=>c.budget&&(st.byCat[c.id]||0)>=c.budget*.8).map(c=>{const sp=st.byCat[c.id]||0,o=sp>=c.budget;
@@ -236,7 +239,8 @@ altro(){const s=S.settings,g=s.goals,r=s.recurring,recExp=r.filter(x=>x.type!=='
   <section class="panel"><h2>Dati</h2><div class="btns"><button class="btn" data-act="export">Esporta CSV</button><label class="btn" style="display:inline-flex;align-items:center">Importa CSV<input type="file" id="imp" accept=".csv,text/csv" hidden></label></div>
    <p class="note">Esporta una volta al mese come copia di sicurezza. L'import accetta il CSV della versione precedente dell'app.</p></section>
   <section class="panel"><h2>Sicurezza</h2><p style="margin:0 0 10px;font-size:15px">Accesso: <b>${esc(S.email||'')}</b> con codice dal telefono.</p>
-   <div class="btns"><button class="btn" data-act="factors">Dispositivi 2FA</button><button class="btn del" data-act="logout">Esci</button></div>
+   <div class="btns"><button class="btn" data-act="factors">Dispositivi 2FA</button><button class="btn del" data-act="logout">Esci</button><button class="btn del" data-act="logoutall">Esci da tutti i dispositivi</button></div>
+   <p class="note" style="margin:14px 0 6px">Blocco automatico dopo inattività (su questo dispositivo):</p><div class="chips">${[["1","1 ora"],["8","8 ore"],["24","24 ore"],["168","7 giorni"]].map(([h,l])=>`<button class="chip ${lockH()===Number(h)?'on':''}" data-act="lockset" data-v="${h}">${l}</button>`).join('')}</div>
    <p class="note">Aggiungi un secondo dispositivo (es. tablet o gestore password): se perdi il telefono resti comunque in grado di entrare.</p></section>`}
 };
 
@@ -416,12 +420,14 @@ async function addFactor(){const box=document.getElementById('enr');const {data,
   box.innerHTML=`<img class="qr" src="${esc(data.totp.qr_code)}" alt="Codice QR"><div class="secret" style="margin:10px 0">${esc(data.totp.secret)}</div>${fld('fcode','Codice a 6 cifre dal nuovo dispositivo','inputmode="numeric" maxlength="6"')}<button class="btn pri" style="margin-top:10px" data-e="verifyfactor">Conferma</button>`}
 
 /* ================= CSV ================= */
-function exportCsv(){const all=[...S.tx.values()].sort((a,b)=>a.date.localeCompare(b.date));
+async function exportCsv(){toast('Preparo il file…');let all;try{all=await fetchRange('1900-01-01')}catch(e){dbFail(e,'export');return}
+  all.sort((a,b)=>a.date.localeCompare(b.date));
+  const safe=x=>/^[=+\-@\t\r]/.test(x)?"'"+x:x;
   const rows=[['Data','Tipo','Categoria','Conto','Importo','Nota','Evitabile','Ricorrente']];
-  for(const t of all)rows.push([t.date,t.type==='inc'?'Entrata':'Uscita',catById(t.cat).name,accName(t.acc),(t.type==='inc'?'':'-')+(t.amount/100).toFixed(2).replace('.',','),t.note||'',t.avoid?'sì':'',t.rec?'sì':'']);
-  const csv='﻿'+rows.map(r=>r.map(x=>/[";\n]/.test(x)?'"'+String(x).replace(/"/g,'""')+'"':x).join(';')).join('\r\n');
+  for(const t of all)rows.push([t.date,t.type==='inc'?'Entrata':'Uscita',safe(catById(t.cat).name),safe(accName(t.acc)),(t.type==='inc'?'':'-')+(t.amount/100).toFixed(2).replace('.',','),safe(t.note||''),t.avoid?'sì':'',t.rec?'sì':'']);
+  const csv='\ufeff'+rows.map(r=>r.map(x=>/[";\n\r]/.test(x)?'"'+String(x).replace(/"/g,'""')+'"':x).join(';')).join('\r\n');
   const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download='budget-'+todayStr()+'.csv';document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},1000);
-  toast('Esportati '+all.length+' movimenti (ultimi 12 mesi caricati)')}
+  toast('Esportati '+all.length+' movimenti')}
 function parseCsv(text){text=text.replace(/^﻿/,'');const out=[];let row=[],f='',q=false;
   for(let i=0;i<text.length;i++){const ch=text[i];if(q){if(ch==='"'){if(text[i+1]==='"'){f+='"';i++}else q=false}else f+=ch}
     else if(ch==='"')q=true;else if(ch===';'){row.push(f);f=''}else if(ch==='\n'){row.push(f.replace(/\r$/,''));out.push(row);row=[];f=''}else f+=ch}
@@ -429,18 +435,18 @@ function parseCsv(text){text=text.replace(/^﻿/,'');const out=[];let row=[],f='
 async function importCsv(file){const rows=parseCsv(await file.text());if(rows.length<2){toast('File vuoto o non riconosciuto');return}
   const h=rows[0].map(x=>x.trim().toLowerCase());const ix=n=>h.indexOf(n);if(ix('data')<0||ix('importo')<0){toast('Intestazioni non riconosciute');return}
   const byName={};for(const c of S.settings.cats)byName[c.name.toLowerCase()+'|'+c.type]=c.id;const accBy={};for(const a of S.settings.accounts)accBy[a.name.toLowerCase()]=a.id;
-  const newCats=[],newAcc=[],list=[];
+  const newCats=[],newAcc=[],list=[],seen={};
   for(const r of rows.slice(1)){if(!r[ix('data')])continue;const date=r[ix('data')].trim();if(!/^\d{4}-\d{2}-\d{2}$/.test(date))continue;
     const type=/entrata/i.test(r[ix('tipo')]||'')?'inc':'exp';const amount=Math.abs(parseEur((r[ix('importo')]||'').replace('-','')));if(!amount)continue;
     const cn=(r[ix('categoria')]||'Altro').trim();let cat=byName[cn.toLowerCase()+'|'+type];
     if(!cat){cat=nid();byName[cn.toLowerCase()+'|'+type]=cat;newCats.push({id:cat,name:cn.slice(0,24),type,budget:0,need:false,color:COLORS[(S.settings.cats.length+newCats.length)%12]})}
     const an=(r[ix('conto')]||'Conto').trim();let acc=accBy[an.toLowerCase()];if(!acc){acc=nid();accBy[an.toLowerCase()]=acc;newAcc.push({id:acc,name:an.slice(0,24)})}
-    const note=(r[ix('nota')]||'').slice(0,200);const id='imp-'+date+'-'+amount+'-'+type+'-'+cat.slice(0,8)+'-'+note.slice(0,10).replace(/[^a-z0-9]/gi,'');
-    list.push({id:id.slice(0,80),date,amount,type,cat,acc,note,avoid:/s[iì]/i.test(r[ix('evitabile')]||''),rec:null,ts:Date.now()})}
+    const note=(r[ix('nota')]||'').replace(/^'(?=[=+\-@])/,'').slice(0,200);const id='imp-'+date+'-'+amount+'-'+type+'-'+cat.slice(0,8)+'-'+note.slice(0,10).replace(/[^a-z0-9]/gi,'');
+    const k=seen[id]=(seen[id]||0)+1;list.push({id:(id.slice(0,74)+'-'+k),date,amount,type,cat,acc,note,avoid:/s[iì]/i.test(r[ix('evitabile')]||''),rec:null,ts:Date.now()})}
   if(!list.length){toast('Nessun movimento valido');return}
   if(newCats.length||newAcc.length)await mutateSettings(s=>{s.cats.push(...newCats);s.accounts.push(...newAcc)});
   const {error}=await sb.from('transactions').upsert(list.map(toRow));if(error){dbFail(error,'import');return}
-  for(const t of list)S.tx.set(t.id,t);reindex();draw();toast('Importati '+list.length+' movimenti')}
+  for(const t of list)S.tx.set(t.id,t);const mn=list.reduce((m,t)=>t.date<m?t.date:m,'9999');if(mn.slice(0,7)<(S.firstYm||'9999'))S.firstYm=mn.slice(0,7);if(S.loadedFrom&&mn.slice(0,7)<S.loadedFrom)S.loadedFrom=mn.slice(0,7);reindex();draw();toast('Importati '+list.length+' movimenti')}
 
 /* ================= toast ================= */
 let tt=0;function toast(msg,undo){const el=document.getElementById('toast'),b=document.getElementById('tact');document.getElementById('tmsg').textContent=msg;
@@ -451,7 +457,7 @@ function go(view){if(!V[view])return;S.view=view;if(location.hash.slice(1)!==vie
 document.addEventListener('submit',e=>{e.preventDefault();if(main.contains(e.target))onAuthSubmit(e.target.id)});
 document.addEventListener('click',e=>{
   const au=e.target.closest('[data-auth]');
-  if(au){const k=au.dataset.auth;if(k==='logout'){sb.auth.signOut().then(()=>{S.phase='login';S.tx=new Map();S.settings=null;draw()});return}
+  if(au){const k=au.dataset.auth;if(k==='logout'){logout('local');return}
     if(k==='copysecret'){navigator.clipboard?.writeText(S.enroll.secret).then(()=>toast('Chiave copiata'),()=>{});return}
     S.auth.mode=k;S.auth.err='';S.auth.msg='';draw();return}
   const g=e.target.closest('[data-go]');if(g&&!sheet.contains(g)){go(g.dataset.go);return}
@@ -464,7 +470,9 @@ document.addEventListener('click',e=>{
     else if(act==='form')openForm(a.dataset.k,a.dataset.id);
     else if(act==='export')exportCsv();
     else if(act==='factors')openFactors();
-    else if(act==='logout'){sb.auth.signOut().then(()=>{S.phase='login';S.tx=new Map();S.settings=null;draw()})}
+    else if(act==='logout')logout('local');
+    else if(act==='logoutall')logout('global');
+    else if(act==='lockset'){ls.set('lockH',a.dataset.v);draw();toast('Blocco automatico aggiornato')}
     return}
   if(sheet.contains(e.target)){const k=e.target.closest('.pad [data-k]');if(k&&E){key(k.dataset.k);return}
     const b=e.target.closest('[data-e]');if(!b)return;const ev=b.dataset.e;
@@ -495,12 +503,22 @@ window.addEventListener('hashchange',()=>{const h=location.hash.slice(1);if(V[h]
 {const h=location.hash.slice(1);if(V[h])S.view=h}
 // ricarica i dati quando torni sull'app (altri dispositivi)
 let lastSync=Date.now();
-document.addEventListener('visibilitychange',async()=>{if(document.visibilityState!=='visible'||S.phase!=='app'||Date.now()-lastSync<60000)return;lastSync=Date.now();
+document.addEventListener('visibilitychange',async()=>{if(document.visibilityState!=='visible'||S.phase!=='app')return;if(await idleCheck())return;if(Date.now()-lastSync<60000)return;lastSync=Date.now();
   try{await route();const from=S.loadedFrom;const rows=await fetchRange(from+'-01');S.tx=new Map(rows.map(t=>[t.id,t]));const {data:st}=await sb.from('settings').select('data').eq('user_id',S.uid).maybeSingle();if(st)S.settings=normSettings(st.data);reindex();await runRecurring();draw()}catch(e){console.warn(e)}});
+
+/* ================= blocco automatico ================= */
+function lockH(){const v=Number(ls.get('lockH'));return [1,8,24,168].includes(v)?v:24}
+function touch(){ls.set('lastActive',String(Date.now()))}
+async function logout(scope,msg){try{await sb.auth.signOut({scope})}catch(e){}S.phase='login';S.tx=new Map();S.settings=null;S.auth.err=msg||'';S.auth.msg='';closeSheet();draw()}
+async function idleCheck(){const last=Number(ls.get('lastActive'))||0;
+  if(last&&Date.now()-last>lockH()*3600e3){const {data:{session}}=await sb.auth.getSession();if(session){await logout('local','Sessione chiusa per inattività: accedi di nuovo.');return true}}
+  touch();return false}
+['pointerdown','keydown'].forEach(ev=>document.addEventListener(ev,()=>{if(S.phase==='app')touch()},{passive:true}));
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'&&S.phase==='app')touch()});
 
 /* ================= avvio ================= */
 if(sb){sb.auth.onAuthStateChange((ev)=>{
-  if(ev==='PASSWORD_RECOVERY'){S.recovery=true;S.phase='boot';route()}
+  if(ev==='PASSWORD_RECOVERY'){S.recovery=true;touch();S.phase='boot';route()}
   else if(ev==='SIGNED_OUT'){S.phase='login';S.tx=new Map();S.settings=null;draw()}});}
-draw();route();
+draw();(async()=>{const fromLink=/access_token|type=recovery|[?&]code=/.test(location.hash+location.search);if(sb&&!fromLink)await idleCheck();else touch();route()})();
 }
