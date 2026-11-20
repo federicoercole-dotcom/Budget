@@ -21,6 +21,11 @@ const pct=(a,b)=>b?Math.round(a/b*100):0;
 const ls={get(k){try{return localStorage.getItem(k)}catch(e){return null}},set(k,v){try{localStorage.setItem(k,v)}catch(e){}}};
 const COLORS=['#8a9a78','#c27a55','#d4a35a','#6f8f8a','#a9798f','#5f7f9a','#b9895f','#7d7a5c','#c9a3a0','#59606b','#9a6b4f','#4f6b4a'];
 const NEEDS=['spesa','casa','trasporti','salute','abbonamenti'];
+const GIRO='__giro';
+const KINDS={conto:'Conto corrente',contanti:'Contanti',carta:'Carta di debito/prepagata',credito:'Carta di credito',risparmio:'Conto risparmio',altro:'Altro'};
+const kindOf=a=>a.kind||({contanti:'contanti',carta:'carta',conto:'conto'}[a.id])||'altro';
+const parseSigned=x=>{x=String(x??'').trim();const neg=/^[-−]/.test(x);const v=parseEur(x.replace(/^[-−]\s*/,''));return isNaN(v)?NaN:(neg?-v:v)};
+const eurS=c=>(c>0?'+':'')+eur(c);
 const DEF={v:2,emergency:0,
   accounts:[{id:'carta',name:'Carta'},{id:'contanti',name:'Contanti'},{id:'conto',name:'Conto'}],
   cats:[['spesa','Spesa alimentare'],['casa','Casa e bollette'],['trasporti','Trasporti'],['ristoranti','Ristoranti e bar'],['shopping','Shopping'],['salute','Salute'],['svago','Svago'],['abbonamenti','Abbonamenti'],['regali','Regali'],['altro','Altro']].map(([id,name],i)=>({id,name,type:'exp',budget:0,color:COLORS[i],need:NEEDS.includes(id)}))
@@ -35,12 +40,27 @@ const main=document.getElementById('main'),ov=document.getElementById('ov'),shee
 
 /* ================= dati ================= */
 const cats=t=>(S.settings?.cats||[]).filter(c=>!t||c.type===t);
-const catById=id=>(S.settings?.cats||[]).find(c=>c.id===id)||{name:'Senza categoria',color:'#999',type:'exp',budget:0};
+const catById=id=>id===GIRO?{id:GIRO,name:'Giroconto',color:'#8b8f84',type:'giro',budget:0}:(S.settings?.cats||[]).find(c=>c.id===id)||{name:'Senza categoria',color:'#999',type:'exp',budget:0};
+const accById=id=>(S.settings?.accounts||[]).find(a=>a.id===id);
+const isGiro=t=>t.cat===GIRO;
+const gidOf=t=>isGiro(t)&&/^g-.+-[oi]$/.test(t.id)?t.id.slice(2,-2):null;
+function giroPair(t){const g=gidOf(t);if(!g)return [t];return [S.tx.get('g-'+g+'-o'),S.tx.get('g-'+g+'-i')].filter(Boolean)}
+const shown=t=>!(isGiro(t)&&gidOf(t)&&t.id.endsWith('-i'));
+/* saldo = saldo allineato + movimenti registrati dopo l'allineamento */
+function balanceOf(a){if(!a||!a.since)return null;let b=a.initial||0;
+  for(const t of S.tx.values()){if(t.acc!==a.id)continue;if(t.date<a.since)continue;if(t.date===a.since&&(t.ts||0)<=(a.sinceTs||0))continue;b+=t.type==='inc'?t.amount:-t.amount}return b}
+function balances(){const list=(S.settings?.accounts||[]).map(a=>({a,b:balanceOf(a)}));const known=list.filter(x=>x.b!==null&&x.a.incl!==false);
+  return {list,total:known.reduce((s,x)=>s+x.b,0),any:known.length>0,liquid:known.filter(x=>kindOf(x.a)!=='credito').reduce((s,x)=>s+x.b,0)}}
+function monthForecast(total){const ym=curYm(),D=dim(ym),day=Number(todayStr().slice(8)),st=stats(ym),tb=totBudget();
+  const pend=(S.settings.recurring||[]).filter(r=>(r.start||'0000-00')<=ym&&Math.min(r.day,D)>day);
+  const recInc=pend.filter(r=>r.type==='inc').reduce((s,r)=>s+r.amount,0),recExp=pend.filter(r=>r.type!=='inc').reduce((s,r)=>s+r.amount,0);
+  const varSp=st.exp-st.recExp,varLeft=day>=3?Math.round(varSp/day*(D-day)):0;
+  const out=tb?Math.max(Math.max(0,tb-st.exp),recExp):recExp+varLeft;return {value:total+recInc-out,recInc,out}}
 const accName=id=>(S.settings?.accounts||[]).find(a=>a.id===id)?.name||'—';
 const totBudget=()=>cats('exp').reduce((s,c)=>s+(c.budget||0),0);
 function reindex(){const m={};for(const t of S.tx.values()){const k=t.date.slice(0,7);(m[k]=m[k]||[]).push(t)}S.byM=m}
 function stats(ym){const tx=S.byM[ym]||[];let inc=0,exp=0,avoid=0,need=0,want=0,recExp=0;const byCat={},byAcc={};
-  for(const t of tx){if(t.type==='inc'){inc+=t.amount;continue}
+  for(const t of tx){if(isGiro(t))continue;if(t.type==='inc'){inc+=t.amount;continue}
     exp+=t.amount;byCat[t.cat]=(byCat[t.cat]||0)+t.amount;byAcc[t.acc]=(byAcc[t.acc]||0)+t.amount;
     if(t.avoid)avoid+=t.amount;if(t.rec)recExp+=t.amount;if(catById(t.cat).need)need+=t.amount;else want+=t.amount}
   return {ym,tx,inc,exp,avoid,need,want,recExp,byCat,byAcc}}
@@ -63,7 +83,7 @@ async function loadAll(){
   const {data:st,error:e1}=await sb.from('settings').select('data').eq('user_id',S.uid).maybeSingle();if(e1)throw e1;
   if(!st){S.settings=clone(DEF);const {error}=await sb.from('settings').upsert({user_id:S.uid,data:S.settings},{onConflict:'user_id',ignoreDuplicates:true});if(error)throw error;const {data:again}=await sb.from('settings').select('data').eq('user_id',S.uid).maybeSingle();if(again)S.settings=normSettings(again.data)}
   else S.settings=normSettings(st.data);
-  const from=addM(curYm(),-12);const rows=await fetchRange(from+'-01');
+  let from=addM(curYm(),-12);for(const a of S.settings.accounts)if(a.since&&a.since.slice(0,7)<from)from=a.since.slice(0,7);const rows=await fetchRange(from+'-01');
   S.tx=new Map(rows.map(t=>[t.id,t]));S.loadedFrom=from;reindex();
   const {data:first}=await sb.from('transactions').select('date').eq('user_id',S.uid).order('date',{ascending:true}).limit(1);
   S.firstYm=first&&first[0]?first[0].date.slice(0,7):curYm();
@@ -170,10 +190,23 @@ function draw(){
 }
 const monthNav=k=>`<header class="top"><button class="ib" data-act="prev" aria-label="Mese precedente">‹</button><h1><span class="kick">${k}</span>${mLabel(S.ym)}</h1><button class="ib" data-act="next" aria-label="Mese successivo" ${S.ym>=curYm()?'disabled':''}>›</button></header>`;
 const initials=s=>esc((s||'?').trim().slice(0,2));
-function txRow(t){const c=catById(t.cat);const inc=t.type==='inc';
+function txRow(t,signed){const c=catById(t.cat);const inc=t.type==='inc';
+  if(isGiro(t)){const p=giroPair(t),o=p.find(x=>x.type==='exp'),i=p.find(x=>x.type==='inc');
+    const route=o&&i?esc(accName(o.acc))+' → '+esc(accName(i.acc)):(inc?'verso ':'da ')+esc(accName(t.acc));
+    return `<button class="tx" data-act="edit" data-id="${esc(t.id)}"><span class="ic" style="background:${c.color}">⇄</span>
+    <span><span class="t1">${esc(t.note||'Giroconto')}</span><span class="t2">${route}</span></span>
+    <span class="am num">${signed?(inc?'+':'−'):'⇄ '}${eur(t.amount)}</span></button>`}
   return `<button class="tx" data-act="edit" data-id="${esc(t.id)}"><span class="ic" style="background:${c.color}">${initials(c.name)}</span>
   <span><span class="t1">${esc(t.note||c.name)}</span><span class="t2">${esc(t.note?c.name+' · ':'')}${esc(accName(t.acc))}${t.rec?'<span class="tag">ricorrente</span>':''}${t.avoid?'<span class="tag">evitabile</span>':''}</span></span>
   <span class="am num ${inc?'inc':''}">${inc?'+':'−'}${eur(t.amount)}</span></button>`}
+function balancesPanel(){const B=balances();const isCur=S.ym===curYm();
+  if(!B.list.some(x=>x.b!==null))return `<section class="panel"><h2>Saldi dei conti</h2><p style="margin:0 0 12px;font-size:15px">Inserisci il saldo reale di ogni conto: da lì l'app lo aggiorna a ogni spesa, entrata o giroconto.</p><div class="btns">${B.list.map(({a})=>`<button class="btn sm" data-act="form" data-k="acc" data-id="${esc(a.id)}">${esc(a.name)}</button>`).join('')}</div></section>`;
+  const fc=isCur?monthForecast(B.total):null;
+  return `<section class="panel"><h2>Saldi dei conti <small>oggi</small></h2>
+   <p style="margin:0;font:600 30px/1.1 Fraunces,Georgia,serif;${B.total<0?'color:var(--bad)':''}" class="num">${eur(B.total)}</p>
+   <p class="note" style="margin:2px 0 10px">Totale dei conti inclusi${fc?` · previsione a fine mese <b class="num" style="${fc.value<0?'color:var(--bad)':'color:var(--ink)'}">${eur(fc.value)}</b>`:''}</p>
+   ${B.list.map(({a,b})=>`<button class="tx" data-act="acct" data-id="${esc(a.id)}"><span class="ic" style="background:var(--olive)">${initials(a.name)}</span><span><span class="t1">${esc(a.name)}</span><span class="t2">${esc(KINDS[kindOf(a)])}${a.incl===false?' · escluso dal totale':''}</span></span><span class="am num" style="${b!==null&&b<0&&kindOf(a)!=='credito'?'color:var(--bad)':''}">${b===null?'<span class="tag">imposta saldo</span>':eur(b)}</span></button>`).join('')}
+   ${fc?'<p class="note">La previsione considera le voci ricorrenti ancora da registrare e il budget rimasto del mese.</p>':''}</section>`}
 function barCls(sp,b){const p=b?sp/b:0;return b&&p>=1?'over':b&&p>=.8?'warn':''}
 function donut(st){const parts=cats('exp').map(c=>({c,v:st.byCat[c.id]||0})).filter(x=>x.v).sort((a,b)=>b.v-a.v);
   if(!parts.length)return '<p class="empty">Nessuna uscita in questo mese.</p>';
@@ -194,14 +227,14 @@ oggi(){const st=stats(S.ym),isCur=S.ym===curYm(),tb=totBudget(),D=dim(S.ym),day=
   const saved=st.inc-st.exp,rate=st.inc?pct(saved,st.inc):null;
   const alerts=cats('exp').filter(c=>c.budget&&(st.byCat[c.id]||0)>=c.budget*.8).map(c=>{const sp=st.byCat[c.id]||0,o=sp>=c.budget;
     return `<div class="alert ${o?'red':''}"><span><b>${esc(c.name)}</b>: ${o?`tetto superato di <span class="num">${eur(sp-c.budget)}</span>.`:`usato il ${pct(sp,c.budget)}% del tetto, restano <span class="num">${eur(c.budget-sp)}</span>.`}</span></div>`}).join('');
-  const recent=[...st.tx].sort((a,b)=>b.date.localeCompare(a.date)||b.ts-a.ts).slice(0,5);
+  const recent=[...st.tx].filter(shown).sort((a,b)=>b.date.localeCompare(a.date)||b.ts-a.ts).slice(0,5);
   const rows=cats('exp').map(c=>({c,sp:st.byCat[c.id]||0})).filter(x=>x.c.budget).sort((a,b)=>b.sp/b.c.budget-a.sp/a.c.budget).map(({c,sp})=>`<div class="row"><div class="nm"><span class="dot" style="background:${c.color}"></span><span>${esc(c.name)}</span></div><div class="vl num">${eur(sp)} <small>/ ${eur(c.budget)}</small></div><div class="bar"><div class="${barCls(sp,c.budget)}" style="width:${Math.min(100,sp/c.budget*100).toFixed(1)}%"></div></div></div>`).join('');
   return monthNav('Panoramica')+hero+`<section class="kpis"><div class="kpi" style="--c:var(--good)"><span>Entrate</span><b class="num">${eur0(st.inc)}</b></div><div class="kpi" style="--c:var(--clay)"><span>Uscite</span><b class="num">${eur0(st.exp)}</b></div><div class="kpi" style="--c:var(--sage)"><span>Risparmio</span><b class="num" style="${saved<0?'color:var(--bad)':''}">${eur0(saved)}</b><i>${rate===null?'—':rate+'% entrate'}</i></div></section>`
-   +alerts+`<section class="panel"><h2>Dove vanno i soldi</h2>${donut(st)}</section>`
+   +alerts+balancesPanel()+`<section class="panel"><h2>Dove vanno i soldi</h2>${donut(st)}</section>`
    +(rows?`<section class="panel"><h2>Tetti <small>speso / tetto</small></h2>${rows}</section>`:'')
    +`<section class="panel"><h2>Ultimi movimenti <button class="btn sm" data-go="movimenti">Tutti</button></h2>${recent.length?recent.map(txRow).join(''):'<p class="empty">Ancora nulla. Tocca + per registrare la prima spesa.</p>'}</section>`},
 
-movimenti(){return monthNav('Movimenti')+`<div class="search"><input id="q" type="search" placeholder="Cerca nota, categoria, conto" value="${esc(S.q)}" autocomplete="off"><select id="fcat"><option value="">Tutte</option>${cats().map(c=>`<option value="${c.id}" ${S.fcat===c.id?'selected':''}>${esc(c.name)}</option>`).join('')}</select></div><div id="list">${listHtml()}</div>`},
+movimenti(){return monthNav('Movimenti')+`<div class="search"><input id="q" type="search" placeholder="Cerca nota, categoria, conto" value="${esc(S.q)}" autocomplete="off"><select id="fcat" aria-label="Filtro"><option value="">Tutto</option><optgroup label="Conti">${S.settings.accounts.map(a=>`<option value="a:${a.id}" ${S.fcat==='a:'+a.id?'selected':''}>${esc(a.name)}</option>`).join('')}</optgroup><optgroup label="Categorie">${cats().map(c=>`<option value="c:${c.id}" ${S.fcat==='c:'+c.id?'selected':''}>${esc(c.name)}</option>`).join('')}<option value="c:${GIRO}" ${S.fcat==='c:'+GIRO?'selected':''}>Giroconti</option></optgroup></select></div><div id="list">${listHtml()}</div>`},
 
 budget(){const st=stats(S.ym),tb=totBudget(),cm=completeMonths(3);const recInc=S.settings.recurring.filter(r=>r.type==='inc').reduce((s,r)=>s+r.amount,0);
   const curInc=stats(curYm()).inc,ai=avg(cm,x=>x.inc)||0,incP=recInc||curInc||ai,src=recInc?'ricorrenti':curInc?'incassate questo mese':'media 3 mesi';
@@ -232,7 +265,7 @@ altro(){const s=S.settings,g=s.goals,r=s.recurring,recExp=r.filter(x=>x.type!=='
    ${r.length?[...r].sort((a,b)=>b.amount-a.amount).map(x=>`<button class="tx" data-act="form" data-k="rec" data-id="${x.id}"><span class="ic" style="background:${catById(x.cat).color}">${initials(x.desc)}</span><span><span class="t1">${esc(x.desc)}</span><span class="t2">Giorno ${x.day} · ${esc(catById(x.cat).name)} · ${esc(accName(x.acc))}</span></span><span class="am num ${x.type==='inc'?'inc':''}">${x.type==='inc'?'+':''}${eur(x.amount)}${x.type!=='inc'?`<span class="t2" style="font-weight:500">${eur0(x.amount*12)}/anno</span>`:''}</span></button>`).join('')
    +(recExp.length?`<p class="note">Le uscite ricorrenti costano <b class="num">${eur(annual)}</b> l'anno.</p>`:''):'<p class="empty">Affitto, bollette, abbonamenti, stipendio: inseriti una volta, registrati da soli ogni mese.</p>'}</section>
   <section class="panel"><h2>Conti e metodi <button class="btn sm" data-act="form" data-k="acc">+ Nuovo</button></h2>
-   <div class="chips">${s.accounts.map(a=>`<button class="chip" data-act="form" data-k="acc" data-id="${a.id}">${esc(a.name)}</button>`).join('')}</div><p class="note">Solo nomi generici: mai IBAN o numeri di carta.</p></section>
+   ${s.accounts.map(a=>{const b=balanceOf(a);return `<button class="tx" data-act="form" data-k="acc" data-id="${a.id}"><span class="ic" style="background:var(--olive)">${initials(a.name)}</span><span><span class="t1">${esc(a.name)}</span><span class="t2">${esc(KINDS[kindOf(a)])}${a.since?' · allineato il '+esc(dLabel(a.since).toLowerCase()):''}</span></span><span class="am num">${b===null?'<span class="tag">imposta saldo</span>':eur(b)}</span></button>`}).join('')}<p class="note">Solo nomi generici: mai IBAN o numeri di carta. Ogni tanto confronta il saldo con la banca e correggilo qui: l'app riparte da quel valore.</p></section>
   <section class="panel"><h2>Categorie <button class="btn sm" data-act="form" data-k="cat">+ Nuova</button></h2>
    <p class="note" style="margin:0 0 6px">Uscite</p><div class="chips">${cats('exp').map(c=>`<button class="chip" data-act="form" data-k="cat" data-id="${c.id}"><span class="dot" style="background:${c.color}"></span>${esc(c.name)}</button>`).join('')}</div>
    <p class="note" style="margin:12px 0 6px">Entrate</p><div class="chips">${cats('inc').map(c=>`<button class="chip" data-act="form" data-k="cat" data-id="${c.id}"><span class="dot" style="background:${c.color}"></span>${esc(c.name)}</button>`).join('')}</div></section>
@@ -245,12 +278,15 @@ altro(){const s=S.settings,g=s.goals,r=s.recurring,recExp=r.filter(x=>x.type!=='
 };
 
 function listHtml(){const q=S.q.trim().toLowerCase();const all=S.byM[S.ym]||[];
-  const tx=all.filter(t=>(!S.fcat||t.cat===S.fcat)&&(!q||(t.note||'').toLowerCase().includes(q)||catById(t.cat).name.toLowerCase().includes(q)||accName(t.acc).toLowerCase().includes(q)));
-  if(!tx.length)return `<p class="empty">${all.length?'Nessun movimento corrisponde alla ricerca.':'Nessun movimento in '+mLabel(S.ym).toLowerCase()+'.'}</p>`;
+  const fa=S.fcat.startsWith('a:')?S.fcat.slice(2):null,fc=S.fcat.startsWith('c:')?S.fcat.slice(2):null;
+  const tx=all.filter(t=>(fa?t.acc===fa:shown(t))&&(!fc||t.cat===fc)&&(!q||(t.note||'').toLowerCase().includes(q)||catById(t.cat).name.toLowerCase().includes(q)||accName(t.acc).toLowerCase().includes(q)));
+  const acc=fa?accById(fa):null,bal=acc?balanceOf(acc):null;
+  const head=acc?`<section class="panel" style="padding:14px 18px"><span class="note" style="margin:0">Saldo attuale · ${esc(acc.name)}</span><p style="margin:2px 0 0;font:600 26px Fraunces,Georgia,serif" class="num">${bal===null?'—':eur(bal)}</p>${bal===null?'<button class="btn sm" data-act="acct" data-id="'+esc(acc.id)+'" style="margin-top:8px">Imposta saldo</button>':''}</section>`:'';
+  if(!tx.length)return head+`<p class="empty">${all.length?'Nessun movimento corrisponde al filtro.':'Nessun movimento in '+mLabel(S.ym).toLowerCase()+'.'}</p>`;
   tx.sort((a,b)=>b.date.localeCompare(a.date)||b.ts-a.ts);
-  const tot=tx.reduce((s,t)=>s+(t.type==='inc'?t.amount:-t.amount),0);const g={};for(const t of tx)(g[t.date]=g[t.date]||[]).push(t);
-  return `<p class="note" style="margin:0 6px">${tx.length} movimenti · saldo <b class="num">${tot>=0?'+':''}${eur(tot)}</b></p>`+Object.keys(g).map(d=>{const day=g[d].reduce((s,t)=>s+(t.type==='inc'?0:t.amount),0);
-    return `<div class="day"><span>${dLabel(d)}</span><span class="num">${day?'−'+eur(day):''}</span></div><div class="panel" style="padding:4px 16px">${g[d].map(txRow).join('')}</div>`}).join('')}
+  const tot=tx.reduce((s,t)=>s+(isGiro(t)&&!fa?0:(t.type==='inc'?t.amount:-t.amount)),0);const g={};for(const t of tx)(g[t.date]=g[t.date]||[]).push(t);
+  return head+`<p class="note" style="margin:0 6px">${tx.length} movimenti · ${fa?'variazione nel mese':'saldo'} <b class="num">${eurS(tot)}</b></p>`+Object.keys(g).map(d=>{const day=g[d].reduce((s,t)=>s+(t.type==='inc'||(isGiro(t)&&!fa)?0:t.amount),0);
+    return `<div class="day"><span>${dLabel(d)}</span><span class="num">${day?'−'+eur(day):''}</span></div><div class="panel" style="padding:4px 16px">${g[d].map(t=>txRow(t,!!fa)).join('')}</div>`}).join('')}
 
 /* ================= consulente finanziario ================= */
 function analyze(){
@@ -311,6 +347,14 @@ function analyze(){
   if(goals.length&&income){if(gq>Math.max(0,saving))add('alta','Obiettivi non sostenibili',`Le quote mensili degli obiettivi (${eur0(gq)}) superano il risparmio medio (${eur0(Math.max(0,saving))}).`,'Allunga una scadenza o riduci una cifra: un piano che non si può rispettare viene abbandonato.');
     else if(saving>0)add('ok','Obiettivi coperti',`Le quote (${eur0(gq)}/mese) stanno nel risparmio medio (${eur0(saving)}/mese).`,`Resta un margine di ${eur0(saving-gq)}/mese da assegnare.`)}
   else if(income&&saving>0&&!goals.length)add('info','Dai un nome al risparmio','Il risparmio senza scopo tende a essere speso.','Crea un obiettivo (vacanza, auto, anticipo casa) con scadenza: l\'app calcola la quota mensile.');
+  const B=balances();
+  for(const {a,b} of B.list){if(b===null||a.incl===false)continue;
+    if(b<0&&kindOf(a)!=='credito')add('alta',`${esc(a.name)} in rosso`,`Il saldo è ${eur(b)}: sugli scoperti la banca applica interessi e commissioni.`,'Copri subito lo scoperto con un giroconto da un altro conto e rimanda le spese non essenziali.');
+    if(b<0&&kindOf(a)==='credito'&&income&&-b>income*.3)add('media',`Debito su ${esc(a.name)}`,`Hai ${eur(-b)} da saldare, oltre il 30% delle entrate mensili.`,'Verifica che l\'addebito sia a saldo e non rateale: le carte revolving costano spesso oltre il 15% annuo.')}
+  if(B.any){const fc=monthForecast(B.total);
+    if(fc.value<0)add('alta','Rischio di chiudere il mese in negativo',`Saldo attuale ${eur0(B.total)}; considerando ricorrenti e budget rimasto, a fine mese arrivi a circa ${eur0(fc.value)}.`,'Riduci le spese discrezionali o sposta una spesa al mese prossimo.');
+    if(essential&&B.liquid<essential)add('alta','Liquidità sotto un mese di spese essenziali',`Sui conti hai ${eur0(B.liquid)} contro ${eur0(essential)} di spese essenziali al mese.`,'Prima di ogni altro obiettivo, ricostruisci almeno un mese di cuscinetto.');
+    else if(essential&&!emer&&B.liquid>essential*4)add('info','Hai liquidità ferma',`Sui conti ci sono ${eur0(B.liquid)}, circa ${(B.liquid/essential).toFixed(1)} mesi di spese essenziali.`,`Separa ${eur0(essential*3)} come fondo emergenza (Risparmio → Fondo emergenza) e dai una destinazione al resto.`)}
   const order={alta:0,media:1,info:2,ok:3};I.sort((a,b)=>order[a.sev]-order[b.sev]||b.impact-a.impact);
   const proj12=saving*12;
   return {score:Math.round(score),comp,I,income,exp,need,want,saving,rate,partial,cm6,emMonths,proj12,avoidM}}
@@ -338,17 +382,20 @@ function advisorView(){const A=analyze();const sc=A.score;const R=54,C=2*Math.PI
 let E=null,F=null;
 function usage(){const n={};for(const t of S.tx.values())n[t.cat]=(n[t.cat]||0)+1;return n}
 function openEntry(t){
-  if(t)E={mode:'edit',id:t.id,type:t.type,buf:toIn(t.amount).replace(/,00$/,''),cat:t.cat,acc:t.acc,date:t.date,note:t.note||'',avoid:!!t.avoid,rec:t.rec,ts:t.ts,prev:t,more:false};
-  else{const lastAcc=ls.get('lastAcc');E={mode:'new',type:'exp',buf:'',cat:null,acc:S.settings.accounts.some(a=>a.id===lastAcc)?lastAcc:S.settings.accounts[0]?.id,date:S.ym===curYm()?todayStr():S.ym+'-01',note:'',avoid:false,more:false}}
+  if(t&&isGiro(t)){const p=giroPair(t),o=p.find(x=>x.type==='exp'),i=p.find(x=>x.type==='inc');
+    E={mode:'edit',id:gidOf(t)||t.id,type:'giro',buf:toIn(t.amount).replace(/,00$/,''),cat:null,acc:o?.acc||S.settings.accounts[0]?.id,to:i?.acc||S.settings.accounts[1]?.id,date:t.date,note:t.note||'',avoid:false,ts:t.ts,prevRows:p,more:false}}
+  else if(t)E={mode:'edit',id:t.id,type:t.type,buf:toIn(t.amount).replace(/,00$/,''),cat:t.cat,acc:t.acc,date:t.date,note:t.note||'',avoid:!!t.avoid,rec:t.rec,ts:t.ts,prev:t,prevRows:[t],more:false};
+  else{const lastAcc=ls.get('lastAcc');E={mode:'new',type:'exp',buf:'',cat:null,acc:S.settings.accounts.some(a=>a.id===lastAcc)?lastAcc:S.settings.accounts[0]?.id,date:S.ym===curYm()?todayStr():S.ym+'-01',note:'',avoid:false,more:false,prevRows:[]};E.to=S.settings.accounts.find(a=>a.id!==E.acc)?.id}
   F=null;drawEntry();ov.classList.add('open');document.body.style.overflow='hidden'}
 function fmtBuf(b){if(!b)return '0';let [i,d]=b.split(',');i=grp(Number(i||0));return d!==undefined?i+','+d:i}
-function drawEntry(){const u=usage();const list=cats(E.type).slice().sort((a,b)=>(u[b.id]||0)-(u[a.id]||0));
-  sheet.innerHTML=`<div class="shead"><div class="seg"><button class="${E.type==='exp'?'on':''}" data-e="type" data-v="exp">Uscita</button><button class="${E.type==='inc'?'on':''}" data-e="type" data-v="inc">Entrata</button></div>
+function drawEntry(){const u=usage();const list=cats(E.type).slice().sort((a,b)=>(u[b.id]||0)-(u[a.id]||0));const G=E.type==='giro';
+  const accChips=(sel,ev)=>`<div class="chips">${S.settings.accounts.map(a=>`<button class="chip ${sel===a.id?'on':''}" data-e="${ev}" data-v="${a.id}">${esc(a.name)}</button>`).join('')}</div>`;
+  sheet.innerHTML=`<div class="shead"><div class="seg"><button class="${E.type==='exp'?'on':''}" data-e="type" data-v="exp">Uscita</button><button class="${E.type==='inc'?'on':''}" data-e="type" data-v="inc">Entrata</button><button class="${G?'on':''}" data-e="type" data-v="giro">Giroconto</button></div>
     <div class="btns">${E.mode==='edit'?'<button class="btn sm del" data-e="del">Elimina</button>':''}<button class="ib" data-e="close" aria-label="Chiudi">×</button></div></div>
   <div class="amount num ${E.buf?'':'ph'}" id="amt" aria-live="polite">€ ${fmtBuf(E.buf)}</div>
-  <div class="chips">${list.map(c=>`<button class="chip ${E.cat===c.id?'on':''}" data-e="cat" data-v="${c.id}"><span class="dot" style="background:${c.color}"></span>${esc(c.name)}</button>`).join('')}</div>
-  <button class="more" data-e="more"><span>${esc(accName(E.acc))} · ${dLabel(E.date)}${E.note?' · '+esc(E.note):''}${E.avoid?' · evitabile':''}</span><span>${E.more?'▴':'▾'}</span></button>
-  <div class="extra ${E.more?'open':''}"><div class="chips">${S.settings.accounts.map(a=>`<button class="chip ${E.acc===a.id?'on':''}" data-e="acc" data-v="${a.id}">${esc(a.name)}</button>`).join('')}</div>
+  ${G?`<p class="note" style="margin:0">Da</p>${accChips(E.acc,'acc')}<p class="note" style="margin:0">A</p>${accChips(E.to,'to')}<p class="note" style="margin:0">Es. prelievo al bancomat (Conto → Contanti), ricarica della prepagata, versamento sul conto risparmio. Non conta come spesa.</p>`:`<div class="chips">${list.map(c=>`<button class="chip ${E.cat===c.id?'on':''}" data-e="cat" data-v="${c.id}"><span class="dot" style="background:${c.color}"></span>${esc(c.name)}</button>`).join('')}</div>`}
+  <button class="more" data-e="more"><span>${G?'':esc(accName(E.acc))+' · '}${dLabel(E.date)}${E.note?' · '+esc(E.note):''}${E.avoid?' · evitabile':''}</span><span>${E.more?'▴':'▾'}</span></button>
+  <div class="extra ${E.more?'open':''}">${G?'':accChips(E.acc,'acc')}
    <div class="grid2"><label class="field">Data<input type="date" id="edate" value="${E.date}" max="${todayStr()}"></label><label class="field">Nota<input id="enote" maxlength="60" value="${esc(E.note)}" placeholder="es. Esselunga"></label></div>
    ${E.type==='exp'?`<label class="check"><input type="checkbox" id="eavoid" ${E.avoid?'checked':''}>Spesa evitabile (potevo farne a meno)</label>`:''}</div>
   <div class="pad">${['1','2','3','4','5','6','7','8','9',',','0','⌫'].map(k=>`<button data-k="${k}" aria-label="${k==='⌫'?'Cancella':k}">${k}</button>`).join('')}</div>
@@ -358,15 +405,29 @@ function key(k){let b=E.buf;if(k==='⌫')b=b.slice(0,-1);else if(k===','){if(!b.
   E.buf=b;const el=document.getElementById('amt');el.textContent='€ '+fmtBuf(b);el.classList.toggle('ph',!b)}
 function keepExtra(){const ne=document.getElementById('enote'),de=document.getElementById('edate'),ae=document.getElementById('eavoid');if(ne)E.note=ne.value;if(de&&de.value)E.date=de.value;if(ae)E.avoid=ae.checked}
 function closeSheet(){ov.classList.remove('open');document.body.style.overflow='';E=null;F=null}
+async function saveRows(rows,prevRows){const keep=new Set(rows.map(r=>r.id));const stale=(prevRows||[]).filter(p=>!keep.has(p.id));
+  for(const p of prevRows||[])S.tx.delete(p.id);for(const r of rows)S.tx.set(r.id,r);reindex();draw();
+  const undo=()=>{for(const r of rows)S.tx.delete(r.id);for(const p of prevRows||[])S.tx.set(p.id,p);reindex();draw()};
+  if(rows.length){const {error}=await sb.from('transactions').upsert(rows.map(toRow));if(error){undo();dbFail(error,'movimento');return false}}
+  if(stale.length){const {error}=await sb.from('transactions').delete().eq('user_id',S.uid).in('id',stale.map(p=>p.id));if(error){undo();dbFail(error,'movimento');return false}}
+  return true}
 function saveEntry(){keepExtra();const amount=parseEur(E.buf);
-  if(!amount){toast('Inserisci un importo');return}if(!E.cat){toast('Scegli una categoria');return}
+  if(!amount){toast('Inserisci un importo');return}
   if(E.date>todayStr()){toast('La data non può essere nel futuro');return}
-  const t={id:E.mode==='edit'?E.id:nid(),date:E.date,amount,type:E.type,cat:E.cat,acc:E.acc,note:E.note.trim(),avoid:E.type==='exp'&&E.avoid,rec:E.rec||null,ts:E.mode==='edit'?E.ts:Date.now()};
-  const prev=E.prev,mode=E.mode;ls.set('lastAcc',E.acc);closeSheet();
+  const prevRows=E.prevRows||[],mode=E.mode;
+  if(E.type==='giro'){if(!E.acc||!E.to||E.acc===E.to){toast('Scegli due conti diversi');return}
+    const gid=mode==='edit'&&prevRows.length&&gidOf(prevRows[0])?gidOf(prevRows[0]):nid(),ts=mode==='edit'?(E.ts||Date.now()):Date.now(),note=E.note.trim();
+    const rows=[{id:'g-'+gid+'-o',date:E.date,amount,type:'exp',cat:GIRO,acc:E.acc,note,avoid:false,rec:null,ts},{id:'g-'+gid+'-i',date:E.date,amount,type:'inc',cat:GIRO,acc:E.to,note,avoid:false,rec:null,ts}];
+    const msg='Giroconto '+eur(amount)+': '+accName(E.acc)+' → '+accName(E.to);closeSheet();saveRows(rows,prevRows).then(ok=>{if(ok)toast(msg)});return}
+  if(!E.cat){toast('Scegli una categoria');return}
+  const prev=E.prev&&!isGiro(E.prev)?E.prev:null;
+  const t={id:prev?prev.id:nid(),date:E.date,amount,type:E.type,cat:E.cat,acc:E.acc,note:E.note.trim(),avoid:E.type==='exp'&&E.avoid,rec:E.rec||null,ts:mode==='edit'?(E.ts||Date.now()):Date.now()};
+  ls.set('lastAcc',E.acc);closeSheet();
   const c=catById(t.cat),ym=t.date.slice(0,7);let msg=(mode==='edit'?'Modificata: ':'Registrata: ')+eur(amount)+' · '+c.name;
   if(t.type==='exp'&&c.budget&&ym===curYm()){const sp=(stats(ym).byCat[c.id]||0)-(prev&&prev.cat===c.id&&prev.date.slice(0,7)===ym?prev.amount:0)+amount;if(sp>=c.budget)msg+=' — tetto superato';else if(sp>=c.budget*.8)msg+=' — '+pct(sp,c.budget)+'% del tetto'}
-  upsertTx(t,prev).then(ok=>{if(ok)toast(msg)})}
-function delEntry(){const t=E.prev;closeSheet();if(!t)return;deleteTx(t).then(ok=>{if(ok)toast('Movimento eliminato',()=>upsertTx(t))})}
+  saveRows([t],prevRows).then(ok=>{if(ok)toast(msg)})}
+function delEntry(){const rows=E.prevRows||[];closeSheet();if(!rows.length)return;
+  saveRows([],rows).then(ok=>{if(ok)toast(rows.length>1?'Giroconto eliminato':'Movimento eliminato',()=>saveRows(rows,[]))})}
 
 /* ================= moduli ================= */
 const fld=(id,label,attrs)=>`<label class="field">${label}<input id="${id}" ${attrs}></label>`;
@@ -381,7 +442,12 @@ function openForm(k,id){const s=S.settings;F={k,id};E=null;let h='',title='',can
     h=fld('f1','Descrizione',`value="${esc(r.desc)}" maxlength="40" placeholder="es. Affitto, Netflix, Stipendio"`)+`<div class="grid2">${fld('f2','Importo mensile (€)',`inputmode="decimal" value="${toIn(r.amount)}"`)}${fld('f3','Giorno del mese',`type="number" min="1" max="31" inputmode="numeric" value="${r.day}"`)}</div>
      <div class="grid2"><label class="field">Categoria<select id="f4"><optgroup label="Uscite">${opt('exp')}</optgroup><optgroup label="Entrate">${opt('inc')}</optgroup></select></label><label class="field">Conto<select id="f5">${s.accounts.map(a=>`<option value="${a.id}" ${r.acc===a.id?'selected':''}>${esc(a.name)}</option>`).join('')}</select></label></div>`
      +(id?'':'<label class="check"><input type="checkbox" id="f6" checked>Registra già questo mese, se il giorno è passato</label>')}
-  else if(k==='acc'){const a=s.accounts.find(x=>x.id===id)||{name:''};title=id?'Modifica conto':'Nuovo conto';h=fld('f1','Nome',`value="${esc(a.name)}" maxlength="24" placeholder="es. Carta prepagata"`)}
+  else if(k==='acc'){const a=s.accounts.find(x=>x.id===id)||{name:'',kind:'conto',incl:true};const b=balanceOf(a);title=id?'Conto: '+esc(a.name):'Nuovo conto';
+    h=fld('f1','Nome',`value="${esc(a.name)}" maxlength="24" placeholder="es. Conto principale"`)
+     +`<label class="field">Tipo<select id="f2">${Object.entries(KINDS).map(([k2,l])=>`<option value="${k2}" ${kindOf(a)===k2?'selected':''}>${l}</option>`).join('')}</select></label>`
+     +fld('f3','Saldo reale adesso (€)',`inputmode="text" autocomplete="off" placeholder="${b===null?'es. 1.250,40':toIn(Math.abs(b))}" value="${b===null?'':(b<0?'-':'')+toIn(Math.abs(b))}"`)
+     +`<p class="note" style="margin:-4px 0 0">${b===null?'Copialo dall\'app della banca. Per la carta di credito usa un valore negativo (es. -320,00) se hai speso.':'Modificalo solo se non coincide con la banca: l\'app riparte da questo valore e conta solo i movimenti successivi.'}</p>`
+     +`<label class="check"><input type="checkbox" id="f4" ${a.incl!==false?'checked':''}>Includi nel totale dei saldi</label>`}
   else if(k==='cat'){const c=s.cats.find(x=>x.id===id)||{name:'',type:'exp',need:false};title=id?'Modifica categoria':'Nuova categoria';
     h=fld('f1','Nome',`value="${esc(c.name)}" maxlength="24"`)+(id?'':'<label class="field">Tipo<select id="f2"><option value="exp">Uscita</option><option value="inc">Entrata</option></select></label>')
      +(c.type==='exp'?`<label class="check"><input type="checkbox" id="f3" ${c.need?'checked':''}>Spesa essenziale (non rinunciabile: casa, cibo, salute…)</label>`:'')}
@@ -400,7 +466,12 @@ async function saveForm(){const {k,id}=F;
     closeSheet();await mutateSettings(s=>{const old=s.recurring.find(x=>x.id===id);const r={id:id||nid(),desc,amount,day,cat,acc,type,start:old?old.start:(now?curYm():addM(curYm(),1))};
       const i=s.recurring.findIndex(x=>x.id===r.id);if(i>=0)s.recurring[i]=r;else s.recurring.push(r)});
     runRecurring();return}
-  else if(k==='acc'){const name=v('f1').trim();if(!name){toast('Serve un nome');return}mutateSettings(s=>{if(id)s.accounts.find(x=>x.id===id).name=name;else s.accounts.push({id:nid(),name})})}
+  else if(k==='acc'){const name=v('f1').trim();if(!name){toast('Serve un nome');return}const kind=v('f2')||'conto',incl=!!document.getElementById('f4')?.checked,raw=v('f3').trim();
+    let val=null;if(raw!==''){val=parseSigned(raw);if(isNaN(val)){toast('Saldo non valido: usa es. 1.250,40 o -320,00');return}}
+    const cur=id?balanceOf(accById(id)):null;
+    mutateSettings(s=>{let a=id?s.accounts.find(x=>x.id===id):null;if(!a){a={id:nid()};s.accounts.push(a)}a.name=name;a.kind=kind;a.incl=incl;
+      if(val!==null&&val!==cur){a.initial=val;a.since=todayStr();a.sinceTs=Date.now()}});
+    if(val!==null&&val!==cur)toast('Saldo di '+name+' impostato a '+eur(val))}
   else if(k==='cat'){const name=v('f1').trim();if(!name){toast('Serve un nome');return}const need=!!document.getElementById('f3')?.checked;
     mutateSettings(s=>{if(id){const c=s.cats.find(x=>x.id===id);c.name=name;if(c.type==='exp')c.need=need}else{const type=v('f2')||'exp';s.cats.push({id:nid(),name,type,budget:0,need:type==='exp'&&need,color:COLORS[s.cats.length%COLORS.length]})}})}
   closeSheet()}
@@ -424,7 +495,7 @@ async function exportCsv(){toast('Preparo il file…');let all;try{all=await fet
   all.sort((a,b)=>a.date.localeCompare(b.date));
   const safe=x=>/^[=+\-@\t\r]/.test(x)?"'"+x:x;
   const rows=[['Data','Tipo','Categoria','Conto','Importo','Nota','Evitabile','Ricorrente']];
-  for(const t of all)rows.push([t.date,t.type==='inc'?'Entrata':'Uscita',safe(catById(t.cat).name),safe(accName(t.acc)),(t.type==='inc'?'':'-')+(t.amount/100).toFixed(2).replace('.',','),safe(t.note||''),t.avoid?'sì':'',t.rec?'sì':'']);
+  for(const t of all)rows.push([t.date,isGiro(t)?(t.type==='inc'?'Giroconto entrata':'Giroconto uscita'):t.type==='inc'?'Entrata':'Uscita',safe(catById(t.cat).name),safe(accName(t.acc)),(t.type==='inc'?'':'-')+(t.amount/100).toFixed(2).replace('.',','),safe(t.note||''),t.avoid?'sì':'',t.rec?'sì':'']);
   const csv='\ufeff'+rows.map(r=>r.map(x=>/[";\n\r]/.test(x)?'"'+String(x).replace(/"/g,'""')+'"':x).join(';')).join('\r\n');
   const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download='budget-'+todayStr()+'.csv';document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},1000);
   toast('Esportati '+all.length+' movimenti')}
@@ -438,7 +509,7 @@ async function importCsv(file){const rows=parseCsv(await file.text());if(rows.le
   const newCats=[],newAcc=[],list=[],seen={};
   for(const r of rows.slice(1)){if(!r[ix('data')])continue;const date=r[ix('data')].trim();if(!/^\d{4}-\d{2}-\d{2}$/.test(date))continue;
     const type=/entrata/i.test(r[ix('tipo')]||'')?'inc':'exp';const amount=Math.abs(parseEur((r[ix('importo')]||'').replace('-','')));if(!amount)continue;
-    const cn=(r[ix('categoria')]||'Altro').trim();let cat=byName[cn.toLowerCase()+'|'+type];
+    const cn=(r[ix('categoria')]||'Altro').trim();let cat=/^giroconto/i.test(r[ix('tipo')]||'')||cn.toLowerCase()==='giroconto'?GIRO:byName[cn.toLowerCase()+'|'+type];
     if(!cat){cat=nid();byName[cn.toLowerCase()+'|'+type]=cat;newCats.push({id:cat,name:cn.slice(0,24),type,budget:0,need:false,color:COLORS[(S.settings.cats.length+newCats.length)%12]})}
     const an=(r[ix('conto')]||'Conto').trim();let acc=accBy[an.toLowerCase()];if(!acc){acc=nid();accBy[an.toLowerCase()]=acc;newAcc.push({id:acc,name:an.slice(0,24)})}
     const note=(r[ix('nota')]||'').replace(/^'(?=[=+\-@])/,'').slice(0,200);const id='imp-'+date+'-'+amount+'-'+type+'-'+cat.slice(0,8)+'-'+note.slice(0,10).replace(/[^a-z0-9]/gi,'');
@@ -468,6 +539,7 @@ document.addEventListener('click',e=>{
     else if(act==='edit'){const t=S.tx.get(a.dataset.id);if(t)openEntry(t)}
     else if(act==='useavg'){const id=a.dataset.cat,val=Number(a.dataset.v);mutateSettings(s=>{s.cats.find(c=>c.id===id).budget=Math.round(val/500)*500||val})}
     else if(act==='form')openForm(a.dataset.k,a.dataset.id);
+    else if(act==='acct'){const ac=accById(a.dataset.id);if(ac&&ac.since){S.fcat='a:'+ac.id;S.q='';go('movimenti')}else openForm('acc',a.dataset.id)}
     else if(act==='export')exportCsv();
     else if(act==='factors')openFactors();
     else if(act==='logout')logout('local');
@@ -482,9 +554,10 @@ document.addEventListener('click',e=>{
     if(ev==='verifyfactor'){sb.auth.mfa.challengeAndVerify({factorId:F.enroll,code:v('fcode').replace(/\D/g,'')}).then(({error})=>{if(error)toast(authErr(error));else{toast('Dispositivo aggiunto');openFactors()}});return}
     if(ev==='unenroll'){sb.auth.mfa.unenroll({factorId:b.dataset.v}).then(({error})=>{if(error)toast(authErr(error));else{toast('Dispositivo rimosso');openFactors()}});return}
     if(!E)return;
-    if(ev==='type'){keepExtra();E.type=b.dataset.v;if(catById(E.cat).type!==E.type)E.cat=null;drawEntry()}
+    if(ev==='type'){keepExtra();E.type=b.dataset.v;if(E.cat&&catById(E.cat).type!==E.type)E.cat=null;if(E.type==='giro'&&(!E.to||E.to===E.acc))E.to=S.settings.accounts.find(a=>a.id!==E.acc)?.id;drawEntry()}
     else if(ev==='cat'){keepExtra();E.cat=b.dataset.v;drawEntry()}
     else if(ev==='acc'){keepExtra();E.acc=b.dataset.v;drawEntry()}
+    else if(ev==='to'){keepExtra();E.to=b.dataset.v;drawEntry()}
     else if(ev==='more'){keepExtra();E.more=!E.more;drawEntry()}
     else if(ev==='save')saveEntry();else if(ev==='del')delEntry()}
 });
@@ -495,7 +568,7 @@ document.addEventListener('keydown',e=>{if(!ov.classList.contains('open'))return
 main.addEventListener('input',e=>{if(e.target.id==='q'){S.q=e.target.value;document.getElementById('list').innerHTML=listHtml()}
   if(e.target.id==='code'&&e.target.value.replace(/\D/g,'').length===6)e.target.form?.requestSubmit()});
 main.addEventListener('change',e=>{const t=e.target;
-  if(t.id==='fcat'){S.fcat=t.value;document.getElementById('list').innerHTML=listHtml()}
+  if(t.id==='fcat'){S.fcat=t.value;draw();return;document.getElementById('list').innerHTML=listHtml()}
   else if(t.id==='imp'&&t.files[0]){importCsv(t.files[0]);t.value=''}
   else if(t.dataset.bud){const val=parseEur(t.value);if(isNaN(val)){toast('Importo non valido');t.value='';return}const id=t.dataset.bud;
     if((catById(id).budget||0)!==val)mutateSettings(s=>{s.cats.find(c=>c.id===id).budget=val})}});
