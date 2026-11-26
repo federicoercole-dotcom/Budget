@@ -582,7 +582,7 @@ async function importCsv(file){const rows=parseCsv(await file.text());if(rows.le
 
 /* ================= toast ================= */
 let tt=0;function toast(msg,undo){const el=document.getElementById('toast'),b=document.getElementById('tact');document.getElementById('tmsg').textContent=msg;
-  b.hidden=!undo;b.onclick=undo?()=>{undo();el.classList.remove('open')}:null;el.classList.add('open');clearTimeout(tt);tt=setTimeout(()=>el.classList.remove('open'),undo?6000:3200)}
+  b.textContent='Annulla';b.hidden=!undo;b.onclick=undo?()=>{undo();el.classList.remove('open')}:null;el.classList.add('open');clearTimeout(tt);tt=setTimeout(()=>el.classList.remove('open'),undo?6000:3200)}
 
 /* ================= eventi ================= */
 function go(view){if(!V[view])return;S.view=view;if(location.hash.slice(1)!==view)history.replaceState(null,'','#'+view);draw();window.scrollTo(0,0)}
@@ -654,6 +654,14 @@ async function idleCheck(){const last=Number(ls.get('lastActive'))||0;
   touch();return false}
 ['pointerdown','keydown'].forEach(ev=>document.addEventListener(ev,()=>{if(S.phase==='app')touch()},{passive:true}));
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'&&S.phase==='app')touch()});
+
+/* ================= aggiornamenti ================= */
+const APP_V='2026.11.26-1';let updShown=false;
+async function checkUpdate(){if(updShown)return;try{const r=await fetch('version.json?t='+Date.now(),{cache:'no-store'});if(!r.ok)return;const j=await r.json();
+  if(j.v&&j.v!==APP_V){updShown=true;const el=document.getElementById('toast'),b=document.getElementById('tact');document.getElementById('tmsg').textContent='Nuova versione dell\'app disponibile';
+    b.hidden=false;b.textContent='Aggiorna';b.onclick=()=>{location.replace(location.pathname+'?u='+Date.now()+location.hash)};el.classList.add('open');clearTimeout(tt)}}catch(e){}}
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')checkUpdate()});
+setTimeout(checkUpdate,3000);
 
 /* ================= avvio ================= */
 if(sb){sb.auth.onAuthStateChange((ev)=>{
